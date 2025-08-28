@@ -58,6 +58,7 @@ Public Sub GenerateReports()
     End If
 
     EnsureMonthFormula
+	EnsureFailsCountFormula
     If TableRowCount(RAW_TABLE) = 0 Then
         ClearReportSheets
         MsgBox "No rows in RawData. Add data, then click Generate.", vbInformation
@@ -91,9 +92,9 @@ Private Sub EnsureRawSheetAndTable()
 
     ' Add headers if empty; create table if missing
     If IsEmpty(ws.Cells(1, 1)) Then
-        ws.Range("A1:J1").Value = Array( _
-            "Date Tested", "SFC", "CCA", "Result", "Failure Type", _
-            "Component PN", "Component Name", "Operation", "Comments", "Month")
+    ws.Range("A1:K1").Value = Array( _
+        "Date Tested", "SFC", "CCA", "Result", "Failure Type", _
+        "Component PN", "Component Name", "Operation", "Comments", "Month", "#Fails")
     End If
 
     Dim lo As ListObject
@@ -114,7 +115,7 @@ Private Sub EnsureRawSheetAndTable()
     End If
 
     ' Lock column order and widths a bit
-    ws.Columns("A:J").ColumnWidth = 18
+    ws.Columns("A:K").ColumnWidth = 18
 
     ' Ensure Month formula is present for data rows
     EnsureMonthFormula
@@ -233,6 +234,24 @@ Private Sub BuildFailureTypes(ByVal recreate As Boolean)
     ch.Chart.Axes(xlCategory).AxisTitle.Characters.Text = "Failure Type"
     ch.Chart.Axes(xlValue).HasTitle = True
     ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Count"
+End Sub
+Private Sub EnsureFailsCountFormula()
+    Dim lo As ListObject, lc As ListColumn
+    Set lo = TableByName(RAW_TABLE)
+    If lo Is Nothing Then Exit Sub
+    If lo.ListRows.Count = 0 Then Exit Sub
+
+    ' Ensure column exists
+    On Error Resume Next
+    Set lc = lo.ListColumns("#Fails")
+    On Error GoTo 0
+    If lc Is Nothing Then
+        Set lc = lo.ListColumns.Add
+        lc.Name = "#Fails"
+    End If
+
+    ' Count fails per SFC
+    lc.DataBodyRange.Formula = "=COUNTIFS([SFC],[@SFC],[Result],""Fail"")"
 End Sub
 
 
