@@ -1,0 +1,59 @@
+import tkinter as tk
+from tkinter import messagebox
+import serial
+import time
+
+# Configure the serial connection (adjust the port and baudrate as per your setup)
+ser = serial.Serial('COM6', 115200, timeout=1)  # Update 'COM3' to your board's serial port
+time.sleep(2)  # Give some time to establish the connection
+
+# Function to send command to STM32 and receive the response
+def send_command(command):
+    if ser.is_open:
+        try:
+            ser.write(command.encode())  # Send command to STM32
+            time.sleep(0.1)  # Small delay
+            response = ser.readline().decode().strip()  # Read response from STM32
+            if response:
+                output_label.config(text=f"Board Response: {response}")
+            else:
+                output_label.config(text="No response from board.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to send command: {str(e)}")
+    else:
+        messagebox.showerror("Error", "Serial port not open.")
+
+# Define command functions for each button
+def start_cw():
+    send_command("start_cw")
+
+def start_ccw():
+    send_command("start_ccw")
+
+def stop_motor():
+    send_command("stop")
+
+# Initialize the tkinter GUI window
+window = tk.Tk()
+window.title("Motor Control Interface")
+window.geometry("400x300")
+
+# Create buttons for motor control
+cw_button = tk.Button(window, text="Start Clockwise", command=start_cw, width=20, height=2)
+cw_button.pack(pady=10)
+
+ccw_button = tk.Button(window, text="Start Counterclockwise", command=start_ccw, width=20, height=2)
+ccw_button.pack(pady=10)
+
+stop_button = tk.Button(window, text="Stop Motor", command=stop_motor, width=20, height=2)
+stop_button.pack(pady=10)
+
+# Label to display the response from the board
+output_label = tk.Label(window, text="Board Response: ", width=40, height=2)
+output_label.pack(pady=20)
+
+# Start the tkinter event loop
+window.mainloop()
+
+# Close the serial connection when the GUI is closed
+ser.close()

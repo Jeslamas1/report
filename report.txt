@@ -1,0 +1,399 @@
+Option Explicit
+
+' ===========================
+' ====== CONFIG / NAMES =====
+' ===========================
+Private Const WS_HOME As String = "Home"
+Private Const WS_RAW As String = "RawData"
+Private Const WS_PASSFAIL As String = "Report_PassFail_3D"
+Private Const WS_FAILTYPES As String = "Report_FailureTypes"
+Private Const WS_FAILSBYCOMP As String = "Report_FailuresByComponent"
+
+Private Const RAW_TABLE As String = "tblRaw"
+
+Private Const PT_PASSFAIL As String = "ptPassFail"
+Private Const PT_FAILTYPES As String = "ptFailTypes"
+Private Const PT_FAILSBYCOMP As String = "ptFailsByComp"
+
+Private Const CH_PASSFAIL As String = "chPassFail3D"
+Private Const CH_FAILTYPES As String = "chFailTypes3D"
+Private Const CH_FAILSBYCOMP As String = "chFailsByComp3D"
+
+' ===========================
+' ====== MAIN ENTRIES =======
+' ===========================
+
+' Run ONCE to scaffold workbook (sheets, table, button, reports)
+Public Sub SetupOnce()
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    On Error GoTo CleanFail
+
+    EnsureRawSheetAndTable
+    EnsureHomeWithButton
+    BuildAllReports True   ' True = (re)create pivots/charts from scratch
+
+    MsgBox "Setup complete. Paste data into 'RawData' and click Generate on Home.", vbInformation
+
+CleanExit:
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+CleanFail:
+    MsgBox "Setup failed: " & Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+' Click handler for the Home button – safe to run anytime
+Public Sub GenerateReports()
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    On Error GoTo CleanFail
+
+    If Not SheetExists(WS_RAW) Then
+        MsgBox "'" & WS_RAW & "' sheet missing. Run SetupOnce.", vbExclamation
+        GoTo CleanExit
+    End If
+
+    EnsureMonthFormula
+    If TableRowCount(RAW_TABLE) = 0 Then
+        ClearReportSheets
+        MsgBox "No rows in RawData. Add data, then click Generate.", vbInformation
+        GoTo CleanExit
+    End If
+
+    BuildAllReports False  ' False = refresh only (don’t delete/replace objects)
+    MsgBox "Reports refreshed.", vbInformation
+
+CleanExit:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+    Exit Sub
+CleanFail:
+    MsgBox "Generate failed: " & Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+' ===========================
+' ====== SETUP HELPERS ======
+' ===========================
+
+Private Sub EnsureRawSheetAndTable()
+    Dim ws As Worksheet
+    If Not SheetExists(WS_RAW) Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=Sheets(Sheets.Count))
+        ws.name = WS_RAW
+    Else
+        Set ws = ThisWorkbook.Worksheets(WS_RAW)
+    End If
+
+    ' Add headers if empty; create table if missing
+    If IsEmpty(ws.Cells(1, 1)) Then
+        ws.Range("A1:J1").Value = Array( _
+            "Date Tested", "SFC", "CCA", "Result", "Failure Type", _
+            "Component PN", "Component Name", "Operation", "Comments", "Month")
+    End If
+
+    Dim lo As ListObject
+    On Error Resume Next
+    Set lo = ws.ListObjects(RAW_TABLE)
+    On Error GoTo 0
+
+    If lo Is Nothing Then
+        ' Size the table to current used range (or at least headers row)
+        Dim lastCol As Long, lastRow As Long
+        lastCol = 10
+        lastRow = Application.Max(2, ws.Cells(ws.Rows.Count, "A").End(xlUp).Row)
+        Dim rng As Range
+        Set rng = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol))
+        Set lo = ws.ListObjects.Add(xlSrcRange, rng, , xlYes)
+        lo.name = RAW_TABLE
+        lo.TableStyle = "TableStyleMedium2"
+    End If
+
+    ' Lock column order and widths a bit
+    ws.Columns("A:J").ColumnWidth = 18
+
+    ' Ensure Month formula is present for data rows
+    EnsureMonthFormula
+End Sub
+
+Private Sub EnsureHomeWithButton()
+    Dim ws As Worksheet
+    If Not SheetExists(WS_HOME) Then
+        Set ws = ThisWorkbook.Worksheets.Add(Before:=Sheets(1))
+        ws.name = WS_HOME
+    Else
+        Set ws = ThisWorkbook.Worksheets(WS_HOME)
+    End If
+
+    With ws
+        .Cells.Clear
+        .Range("B2").Value = "CCA Failure Trend Report"
+        .Range("B2").Font.Size = 20
+        .Range("B2").Font.Bold = True
+        .Range("B4").Value = "1) Paste/append data on 'RawData' (use exact headers)."
+        .Range("B5").Value = "2) Click 'Generate Reports' to (re)build charts."
+        .Range("B7").Value = "Columns required:"
+        .Range("B8").Resize(10, 1).Value = Application.Transpose(Array( _
+            "Date Tested", "SFC", "CCA", "Result", "Failure Type", _
+            "Component PN", "Component Name", "Operation", "Comments", "Month"))
+
+        AddOrReplaceButton ws, "btnGenerate", "Generate Reports", "GenerateReports", _
+                           LeftPos:=.Range("B10").left, TopPos:=.Range("D10").top, _
+                           Width:=180, Height:=40
+    End With
+End Sub
+
+' ===========================
+' ====== BUILD REPORTS ======
+' ===========================
+
+Private Sub BuildAllReports(ByVal recreate As Boolean)
+    BuildPassFail3D recreate
+    BuildFailureTypes recreate
+    BuildFailuresByComponent recreate
+End Sub
+
+' --- Report 1: Pass vs Fail by Month (3D clustered columns)
+Private Sub BuildPassFail3D(ByVal recreate As Boolean)
+    Dim ws As Worksheet, lo As ListObject, pc As PivotCache, pt As PivotTable, ch As ChartObject
+
+    Set lo = TableByName(RAW_TABLE)
+    If lo Is Nothing Then Exit Sub
+
+    Set ws = EnsureSheet(WS_PASSFAIL, recreate)
+
+    ' (Re)create pivot
+    DeletePivotIfExists ws, PT_PASSFAIL
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=lo.Range)
+    Set pt = ws.PivotTables.Add(PivotCache:=pc, TableDestination:=ws.Range("B5"), tableName:=PT_PASSFAIL)
+
+    With pt
+        .PivotFields("Month").Orientation = xlRowField
+        .PivotFields("Month").Position = 1
+        .PivotFields("Result").Orientation = xlColumnField
+        .PivotFields("Result").Position = 1
+        .AddDataField .PivotFields("SFC"), "Count of SFC", xlCount
+
+        ' Sort months ascending
+        .PivotFields("Month").AutoSort xlAscending, "Month"
+        .RowAxisLayout xlTabularRow
+    End With
+
+    ' (Re)create chart
+    DeleteChartIfExists ws, CH_PASSFAIL
+    Set ch = ws.ChartObjects.Add(left:=ws.Range("B2").left, top:=ws.Range("B2").top, Width:=700, Height:=350)
+    ch.name = CH_PASSFAIL
+    ch.Chart.SetSourceData pt.TableRange1
+    ch.Chart.ChartType = xl3DColumnClustered
+    ch.Chart.HasTitle = True
+    ch.Chart.ChartTitle.Text = "Pass vs Fail by Month (3D)"
+    ch.Chart.Axes(xlCategory).HasTitle = True
+    ch.Chart.Axes(xlCategory).AxisTitle.Characters.Text = "Month"
+    ch.Chart.Axes(xlValue).HasTitle = True
+    ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Unit Count"
+End Sub
+
+' --- Report 2: Failure Types (counts)
+Private Sub BuildFailureTypes(ByVal recreate As Boolean)
+    Dim ws As Worksheet, lo As ListObject, pc As PivotCache, pt As PivotTable, ch As ChartObject
+
+    Set lo = TableByName(RAW_TABLE)
+    If lo Is Nothing Then Exit Sub
+
+    Set ws = EnsureSheet(WS_FAILTYPES, recreate)
+
+    DeletePivotIfExists ws, PT_FAILTYPES
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=lo.Range)
+    Set pt = ws.PivotTables.Add(PivotCache:=pc, TableDestination:=ws.Range("B5"), tableName:=PT_FAILTYPES)
+
+    With pt
+        .PivotFields("Failure Type").Orientation = xlRowField
+        .PivotFields("Failure Type").Position = 1
+        .AddDataField .PivotFields("SFC"), "Count of SFC", xlCount
+        .RowAxisLayout xlTabularRow
+        .PivotFields("Failure Type").AutoSort xlDescending, "Count of SFC"
+        On Error Resume Next
+        .PivotFields("Result").Orientation = xlPageField
+        .PivotFields("Result").CurrentPage = "(All)"
+        On Error GoTo 0
+    End With
+
+    DeleteChartIfExists ws, CH_FAILTYPES
+    Set ch = ws.ChartObjects.Add(left:=ws.Range("B2").left, top:=ws.Range("B2").top, Width:=700, Height:=350)
+    ch.name = CH_FAILTYPES
+    ch.Chart.SetSourceData pt.TableRange1
+    ch.Chart.ChartType = xl3DColumnClustered
+    ch.Chart.HasTitle = True
+    ch.Chart.ChartTitle.Text = "Failure Types (Counts)"
+    ch.Chart.Axes(xlCategory).HasTitle = True
+    ch.Chart.Axes(xlCategory).AxisTitle.Characters.Text = "Failure Type"
+    ch.Chart.Axes(xlValue).HasTitle = True
+    ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Count"
+End Sub
+
+
+' --- Report 3: Failures Qty by Component Name (fail-only)
+Private Sub BuildFailuresByComponent(ByVal recreate As Boolean)
+    Dim ws As Worksheet, lo As ListObject, pc As PivotCache, pt As PivotTable, ch As ChartObject
+
+    Set lo = TableByName(RAW_TABLE)
+    If lo Is Nothing Then Exit Sub
+
+    Set ws = EnsureSheet(WS_FAILSBYCOMP, recreate)
+
+    DeletePivotIfExists ws, PT_FAILSBYCOMP
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=lo.Range)
+    Set pt = ws.PivotTables.Add(PivotCache:=pc, TableDestination:=ws.Range("B5"), tableName:=PT_FAILSBYCOMP)
+
+    With pt
+        .PivotFields("Component Name").Orientation = xlRowField
+        .PivotFields("Component Name").Position = 1
+        .AddDataField .PivotFields("SFC"), "Failures (Count)", xlCount
+        .RowAxisLayout xlTabularRow
+
+        ' Add Result as a filter and set to Fail
+        .PivotFields("Result").Orientation = xlPageField
+        On Error Resume Next
+        .PivotFields("Result").CurrentPage = "Fail"
+        On Error GoTo 0
+
+        .PivotFields("Component Name").AutoSort xlDescending, "Failures (Count)"
+    End With
+
+    DeleteChartIfExists ws, CH_FAILSBYCOMP
+    Set ch = ws.ChartObjects.Add(left:=ws.Range("B2").left, top:=ws.Range("B2").top, Width:=750, Height:=380)
+    ch.name = CH_FAILSBYCOMP
+    ch.Chart.SetSourceData pt.TableRange1
+    ch.Chart.ChartType = xl3DColumnClustered
+    ch.Chart.HasTitle = True
+    ch.Chart.ChartTitle.Text = "Failures Qty by Component Name (Fail Only)"
+    ch.Chart.Axes(xlCategory).HasTitle = True
+    ch.Chart.Axes(xlCategory).AxisTitle.Characters.Text = "Component Name"
+    ch.Chart.Axes(xlValue).HasTitle = True
+    ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Failure Count"
+End Sub
+
+' ===========================
+' ====== UTIL FUNCTIONS =====
+' ===========================
+
+Private Function SheetExists(ByVal name As String) As Boolean
+    On Error Resume Next
+    SheetExists = Not ThisWorkbook.Worksheets(name) Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function EnsureSheet(ByVal name As String, ByVal recreate As Boolean) As Worksheet
+    If SheetExists(name) Then
+        Set EnsureSheet = ThisWorkbook.Worksheets(name)
+        If recreate Then
+            EnsureSheet.Cells.Clear
+        End If
+    Else
+        Set EnsureSheet = ThisWorkbook.Worksheets.Add(After:=Sheets(Sheets.Count))
+        EnsureSheet.name = name
+    End If
+    ' Title
+    With EnsureSheet.Range("B2")
+        .Value = name
+        .Font.Bold = True
+        .Font.Size = 16
+    End With
+End Function
+
+Private Sub DeletePivotIfExists(ByVal ws As Worksheet, ByVal ptName As String)
+    On Error Resume Next
+    ws.PivotTables(ptName).TableRange2.Clear
+    ws.PivotTables(ptName).PivotCache.MissingItemsLimit = xlMissingItemsNone
+    ws.PivotTables(ptName).PivotCache.Refresh
+    On Error GoTo 0
+End Sub
+
+Private Sub DeleteChartIfExists(ByVal ws As Worksheet, ByVal chName As String)
+    Dim co As ChartObject
+    On Error Resume Next
+    Set co = ws.ChartObjects(chName)
+    If Not co Is Nothing Then co.Delete
+    On Error GoTo 0
+End Sub
+
+Private Function TableByName(ByVal tableName As String) As ListObject
+    Dim ws As Worksheet, lo As ListObject
+    For Each ws In ThisWorkbook.Worksheets
+        For Each lo In ws.ListObjects
+            If LCase(lo.name) = LCase(tableName) Then
+                Set TableByName = lo
+                Exit Function
+            End If
+        Next lo
+    Next ws
+End Function
+
+Private Sub EnsureMonthFormula()
+    Dim lo As ListObject, rngData As Range
+    Set lo = TableByName(RAW_TABLE)
+    If lo Is Nothing Then Exit Sub
+
+    Dim monthCol As Long
+    monthCol = lo.ListColumns("Month").Index
+
+    ' If there are data rows, fill Month when Date Tested exists and Month is blank
+    If lo.ListRows.Count = 0 Then Exit Sub
+
+    Dim r As ListRow
+    For Each r In lo.ListRows
+        With r.Range
+            If IsDate(.Cells(1, 1).Value) Then
+                If Trim$(CStr(.Cells(1, monthCol).Value)) = "" Then
+                    ' yyyy-mm keeps nice ordering
+                    .Cells(1, monthCol).Formula = "=TEXT([@[Date Tested]],""yyyy-mm"")"
+                End If
+            End If
+        End With
+    Next r
+    lo.Range.Calculate
+End Sub
+
+Private Function TableRowCount(ByVal tableName As String) As Long
+    Dim lo As ListObject
+    Set lo = TableByName(tableName)
+    If lo Is Nothing Then
+        TableRowCount = 0
+    Else
+        TableRowCount = lo.ListRows.Count
+    End If
+End Function
+
+Private Sub ClearReportSheets()
+    Dim n As Variant
+    For Each n In Array(WS_PASSFAIL, WS_FAILTYPES, WS_FAILSBYCOMP)
+        If SheetExists(n) Then ThisWorkbook.Worksheets(n).Cells.Clear
+    Next n
+End Sub
+
+Private Sub AddOrReplaceButton(ByVal ws As Worksheet, ByVal btnName As String, _
+                               ByVal caption As String, ByVal macroName As String, _
+                               ByVal LeftPos As Double, ByVal TopPos As Double, _
+                               ByVal Width As Double, ByVal Height As Double)
+    Dim shp As Shape
+    ' Delete existing
+    On Error Resume Next
+    ws.Shapes(btnName).Delete
+    On Error GoTo 0
+
+    Set shp = ws.Shapes.AddShape(msoShapeRoundedRectangle, LeftPos, TopPos, Width, Height)
+    shp.name = btnName
+    With shp
+        .TextFrame2.TextRange.Characters.Text = caption
+        .Fill.ForeColor.RGB = RGB(0, 120, 215)
+        .TextFrame2.TextRange.Font.Fill.ForeColor.RGB = RGB(255, 255, 255)
+        .TextFrame2.TextRange.Font.Size = 12
+        .OnAction = macroName
+    End With
+End Sub
+
+

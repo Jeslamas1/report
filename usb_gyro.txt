@@ -1,0 +1,430 @@
+#include "stm32f4xx_hal.h"
+#include "usb_device.h"
+#include "usbd_cdc_if.h"
+#include "string.h"
+#include <stdio.h>
+ // Or the appropriate path for the sensor library
+#include <stdbool.h> // For true/false definitions
+
+
+
+#define ISM330DLC_I2C_ADDRESS 0x6A << 1
+#define WHO_AM_I_REG 0x0F
+#define CTRL1_XL 0x10
+#define CTRL2_G 0x11
+#define OUTX_L_G 0x22
+#define OUTX_L_XL 0x28
+
+I2C_HandleTypeDef hi2c1;
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
+// Motor control states
+typedef enum {
+    MOTOR_STOP = 0,
+    MOTOR_CW,
+    MOTOR_CCW
+} MotorState;
+
+// Define pin mappings for motor control and button
+#define PUL_PIN        GPIO_PIN_2     // PUL+ (PA2)
+#define DIR_PIN        GPIO_PIN_3     // DIR+ (PA3)
+#define BUTTON_PIN     GPIO_PIN_0     // B1 button (PA0)
+#define MOTOR_PORT     GPIOA          // Motor GPIO Port
+
+MotorState motorState = MOTOR_STOP;   // Initial state: motor stopped
+
+// USB buffer
+extern uint8_t UserRxBufferFS[APP_RX_DATA_SIZE];
+char data[64] = "Motor Control Ready\n";
+uint8_t buffer[64] = {0};
+uint32_t lastUsbTransmitTime = 0;  // Timestamp for USB data transmission
+uint16_t usbTransmitInterval = 500; // USB data transmission interval in milliseconds
+int16_t accel_offset[3];
+int16_t gyro_offset[3];
+
+// Forward declaration of functions
+void SystemClock_Config(void);
+void GPIO_Init(void);
+void ISM330DLC_Init(void);
+void ISM330DLC_ReadAccelerometer(int16_t *accel_data);
+void ISM330DLC_ReadGyroscope(int16_t *gyro_data);
+void MX_USB_DEVICE_Init(void);
+void Motor_Control(MotorState state);
+void Process_USB_Command(uint8_t* Buf, uint16_t Len);
+void I2C1_Init(void);
+void CDC_Transmit_Data(char* data);
+
+void ISM330DLC_Calibrate(void) {
+    const int calibration_samples = 100;
+    int32_t accel_sum[3] = {0};
+    int32_t gyro_sum[3] = {0};
+    int16_t accel_data[3];
+    int16_t gyro_data[3];
+
+    // Accumulate sensor values
+    for (int i = 0; i < calibration_samples; i++) {
+        ISM330DLC_ReadAccelerometer(accel_data);
+        ISM330DLC_ReadGyroscope(gyro_data);
+
+        accel_sum[0] += accel_data[0];
+        accel_sum[1] += accel_data[1];
+        accel_sum[2] += accel_data[2];
+
+        gyro_sum[0] += gyro_data[0];
+        gyro_sum[1] += gyro_data[1];
+        gyro_sum[2] += gyro_data[2];
+
+        HAL_Delay(10);  // Short delay between readings
+    }
+
+    // Calculate offsets
+    accel_offset[0] = accel_sum[0] / calibration_samples;
+    accel_offset[1] = accel_sum[1] / calibration_samples;
+    accel_offset[2] = accel_sum[2] / calibration_samples;
+
+    gyro_offset[0] = gyro_sum[0] / calibration_samples;
+    gyro_offset[1] = gyro_sum[1] / calibration_samples;
+    gyro_offset[2] = gyro_sum[2] / calibration_samples;
+
+    CDC_Transmit_Data("Calibration Complete\n");
+}
+
+void ISM330DLC_ReadAccelerometer_Calibrated(int16_t *accel_data) {
+    int16_t raw_data[3];
+    ISM330DLC_ReadAccelerometer(raw_data);
+
+    // Subtract offsets (assuming offsets are stored globally)
+    accel_data[0] = raw_data[0] - accel_offset[0];
+    accel_data[1] = raw_data[1] - accel_offset[1];
+    accel_data[2] = raw_data[2] - accel_offset[2];
+}
+
+void ISM330DLC_ReadGyroscope_Calibrated(int16_t *gyro_data) {
+    int16_t raw_data[3];
+    ISM330DLC_ReadGyroscope(raw_data);
+
+    // Subtract offsets (assuming offsets are stored globally)
+    gyro_data[0] = raw_data[0] - gyro_offset[0];
+    gyro_data[1] = raw_data[1] - gyro_offset[1];
+    gyro_data[2] = raw_data[2] - gyro_offset[2];
+}
+
+
+int main(void) {
+    // Step 1: Initialize HAL and System
+    HAL_Init();
+    SystemClock_Config();
+    GPIO_Init();
+    I2C1_Init();
+    MX_USB_DEVICE_Init(); // Initialize USB device first
+    ISM330DLC_Init();
+
+    // Send initial message to indicate USB is ready
+    char* initMsg = "USB Initialized. Motor Control Ready\n";
+    CDC_Transmit_Data(initMsg);
+
+    int16_t accel_data[3] = {0};
+    int16_t gyro_data[3] = {0};
+    uint16_t lastMotorUpdate = 0;   // Timestamp for motor updates
+    uint16_t lastSensorUpdate = 0;  // Timestamp for sensor updates
+    uint16_t motorInterval = 10;     // Motor update interval in milliseconds (0.1 ms is too short for HAL_Delay)
+    uint16_t sensorInterval = 1000; // Sensor update interval in milliseconds
+
+
+    while (1) {
+        // Check if a new command has been received over USB
+        if (strlen((char*)buffer) > 0) {
+            // Process the received command
+            Process_USB_Command(buffer, strlen((char*)buffer));
+
+            // Clear the buffer after processing
+            memset(buffer, 0, sizeof(buffer));  // Clear buffer after processing
+
+        }
+
+        // Run the motor based on the current state at a higher frequency
+        if (HAL_GetTick() - lastMotorUpdate >= motorInterval) {
+            Motor_Control(motorState);
+            lastMotorUpdate = HAL_GetTick(); // Update timestamp
+        }
+
+        // Read sensors and print IMU data to USB at a slower frequency
+        // Read sensors and print IMU data to USB at a slower frequency
+        if (HAL_GetTick() - lastSensorUpdate >= sensorInterval) {
+            ISM330DLC_ReadAccelerometer(accel_data);
+            ISM330DLC_ReadGyroscope(gyro_data);
+
+            // Convert raw data to physical units
+            float accel_g[3];
+            float gyro_dps[3];
+            accel_g[0] = accel_data[0] * 0.0605f * 0.001f;  // Convert to g
+            accel_g[1] = accel_data[1] * 0.0605f * 0.001f;
+            accel_g[2] = accel_data[2] * 0.0605f * 0.001f;
+
+            gyro_dps[0] = gyro_data[0] * 0.00424f;  // Convert to dps
+            gyro_dps[1] = gyro_data[1] * 0.00424f;
+            gyro_dps[2] = gyro_data[2] * 0.00424f;
+
+            // Only transmit USB data if enough time has passed since the last transmission
+            if (HAL_GetTick() - lastUsbTransmitTime >= usbTransmitInterval) {
+                char imuData[256];
+                int ret = snprintf(imuData, sizeof(imuData),
+                                   "Gyro (dps) X: %.2f, Y: %.2f, Z: %.2f, Accel (g) X: %.3f, Y: %.3f, Z: %.3f\n",
+                                   gyro_dps[0], gyro_dps[1], gyro_dps[2],
+                                   accel_g[0], accel_g[1], accel_g[2]);
+
+                // Check if the output was truncated
+                if (ret >= 0 && ret < sizeof(imuData)) {
+                    CDC_Transmit_Data(imuData);
+                } else {
+                    CDC_Transmit_Data("Error: IMU data output truncated\n");
+                }
+
+                lastUsbTransmitTime = HAL_GetTick(); // Update timestamp for USB transmission
+            }
+
+            lastSensorUpdate = HAL_GetTick(); // Update sensor read timestamp
+        }
+
+
+        HAL_Delay(10); // Short delay to prevent rapid looping
+    }
+
+}
+
+
+
+void I2C1_Init(void)
+{
+    __HAL_RCC_I2C1_CLK_ENABLE();  // Enable I2C1 clock
+
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+        // Initialization Error
+        Error_Handler();
+    }
+}
+void ISM330DLC_Init(void)
+{
+    // Configure I2C communication for ISM330DLC
+    uint8_t who_am_i = 0;
+
+    // Check if the sensor is responding correctly
+    if (HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, 0x0F, 1, &who_am_i, 1, 100) == HAL_OK) {
+        if (who_am_i == 0x6A) {
+            CDC_Transmit_Data("ISM330DLC Communication Successful\n");
+        } else {
+            char error_msg[50];
+            snprintf(error_msg, sizeof(error_msg), "Unexpected WHO_AM_I value: 0x%02X\n", who_am_i);
+            CDC_Transmit_Data(error_msg);
+            return; // If the sensor is not responding with the correct ID, stop initialization
+        }
+    } else {
+        CDC_Transmit_Data("Error: I2C Read Failed: WHO_AM_I\n");
+        return; // If the I2C read fails, stop initialization
+    }
+
+    // Now configure the accelerometer and gyroscope registers
+    uint8_t accel_config = 0x60; // ODR 416 Hz, ±2g
+    uint8_t gyro_config = 0x60;  // ODR 416 Hz, 2000 dps
+
+    if (HAL_I2C_Mem_Write(&hi2c1, ISM330DLC_I2C_ADDRESS, 0x10, 1, &accel_config, 1, 100) != HAL_OK) {
+        CDC_Transmit_Data("Error: Failed to configure CTRL1_XL\n");
+    }
+    if (HAL_I2C_Mem_Write(&hi2c1, ISM330DLC_I2C_ADDRESS, 0x11, 1, &gyro_config, 1, 100) != HAL_OK) {
+        CDC_Transmit_Data("Error: Failed to configure CTRL2_G\n");
+    }
+}
+
+
+// Function to read accelerometer data
+// Corrected function to read accelerometer data
+void ISM330DLC_ReadAccelerometer(int16_t *accel_data)
+{
+    uint8_t accel_buffer[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, 0x28, 1, accel_buffer, 6, 100) == HAL_OK) {
+        accel_data[0] = (int16_t)(accel_buffer[1] << 8 | accel_buffer[0]); // X-axis data
+        accel_data[1] = (int16_t)(accel_buffer[3] << 8 | accel_buffer[2]); // Y-axis data
+        accel_data[2] = (int16_t)(accel_buffer[5] << 8 | accel_buffer[4]); // Z-axis data
+
+    }
+    else {
+        CDC_Transmit_Data("Error: I2C Read Failed: Accelerometer\n");
+    }
+}
+
+
+void ISM330DLC_ReadGyroscope(int16_t *gyro_data)
+{
+    uint8_t gyro_buffer[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, 0x22, 1, gyro_buffer, 6, 100) == HAL_OK) {
+        gyro_data[0] = (int16_t)(gyro_buffer[1] << 8 | gyro_buffer[0]); // X-axis data
+        gyro_data[1] = (int16_t)(gyro_buffer[3] << 8 | gyro_buffer[2]); // Y-axis data
+        gyro_data[2] = (int16_t)(gyro_buffer[5] << 8 | gyro_buffer[4]); // Z-axis data
+    }
+    else {
+        CDC_Transmit_Data("Error: I2C Read Failed: Gyroscope\n");
+    }
+}
+
+// Function to control motor based on its state
+void Motor_Control(MotorState state) {
+    switch (state) {
+        case MOTOR_CW:
+            // Set DIR+ high for clockwise direction
+            HAL_GPIO_WritePin(MOTOR_PORT, DIR_PIN, GPIO_PIN_SET);
+
+            // Generate a pulse on PUL+
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_SET);
+            HAL_Delay(0);  // Reduce or eliminate delay to increase speed
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_RESET);
+            break;
+
+        case MOTOR_CCW:
+            // Set DIR+ low for counterclockwise direction
+            HAL_GPIO_WritePin(MOTOR_PORT, DIR_PIN, GPIO_PIN_RESET);
+
+            // Generate a pulse on PUL+
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_SET);
+            HAL_Delay(0);  // Reduce or eliminate delay to increase speed
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_RESET);
+            break;
+
+        case MOTOR_STOP:
+        default:
+            // Stop motor (no pulses generated)
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_RESET);
+            break;
+    }
+}
+
+
+// Function to process USB commands received from PuTTY
+// Function to process USB commands received from PuTTY
+void Process_USB_Command(uint8_t* Buf, uint16_t Len)
+{
+    // Null-terminate the received buffer to avoid trailing characters
+    Buf[Len] = '\0';
+
+    if (strncmp((char*)Buf, "start_cw", strlen("start_cw")) == 0) {
+        motorState = MOTOR_CW;
+        CDC_Transmit_Data("Motor started clockwise\n");
+    }
+    else if (strncmp((char*)Buf, "start_ccw", strlen("start_ccw")) == 0) {
+        motorState = MOTOR_CCW;
+        CDC_Transmit_Data("Motor started counterclockwise\n");
+    }
+    else if (strncmp((char*)Buf, "stop", strlen("stop")) == 0) {
+        motorState = MOTOR_STOP;
+        CDC_Transmit_Data("Motor stopped\n");
+    }
+    else if (strncmp((char*)Buf, ".", strlen(".")) == 0) {
+        // Send sensor data when "." command is received
+        int16_t accel_data[3] = {0};
+        int16_t gyro_data[3] = {0};
+        ISM330DLC_ReadAccelerometer(accel_data);
+        ISM330DLC_ReadGyroscope(gyro_data);
+
+        char imuData[256];
+        snprintf(imuData, sizeof(imuData),
+                 "Gyro (dps) X: %.2f, Y: %.2f, Z: %.2f, Accel (g) X: %.3f, Y: %.3f, Z: %.3f\n",
+                 gyro_data[0] * 0.00424f, gyro_data[1] * 0.00424f, gyro_data[2] * 0.00424f,
+                 accel_data[0] * 0.0605f * 0.001f, accel_data[1] * 0.0605f * 0.001f, accel_data[2] * 0.0605f * 0.001f);
+        CDC_Transmit_Data(imuData);
+    }
+    else {
+        CDC_Transmit_Data("Invalid command\n");
+    }
+}
+
+
+
+// Function to transmit data via USB CDC to PuTTY
+// Function to transmit data via USB CDC to PuTTY
+void CDC_Transmit_Data(char* data) {
+    while (CDC_Transmit_FS((uint8_t*)data, strlen(data)) == USBD_BUSY) {
+        HAL_Delay(1);  // Wait until the USB buffer is free
+    }
+}
+
+// GPIO initialization function
+void GPIO_Init(void)
+{
+    __HAL_RCC_GPIOA_CLK_ENABLE();  // Enable GPIOA clock
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // Configure PUL+ and DIR+ as output
+    GPIO_InitStruct.Pin = PUL_PIN | DIR_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(MOTOR_PORT, &GPIO_InitStruct);
+
+    // Configure B1 button as input (PA0)
+    GPIO_InitStruct.Pin = BUTTON_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(MOTOR_PORT, &GPIO_InitStruct);
+}
+int __io_putchar(int ch) {
+    uint8_t data = ch;
+    USBD_CDC_SetTxBuffer(&hUsbDeviceFS, &data, 1);
+    USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+    return ch;
+}
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    // Configure the main internal regulator output voltage
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    // Initializes the RCC Oscillators
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ = 7;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        // Initialization Error
+        while(1);
+    }
+
+    // Initializes the CPU, AHB and APB buses clocks
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+    {
+        // Initialization Error
+        while(1);
+    }
+}
+void Error_Handler(void)
+{
+    // Error handling code (infinite loop or system reset)
+    while(1)
+    {
+        // Optionally toggle an LED or other indicator
+    }
+}

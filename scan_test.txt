@@ -1,0 +1,600 @@
+#include "stm32f4xx_hal.h"
+#include "usb_device.h"
+#include "usbd_cdc_if.h"
+#include "string.h"
+#include <stdio.h>
+#include <stdbool.h>
+#include <math.h> // Include math library for trigonometric functions
+
+#define ISM330DLC_I2C_ADDRESS (0x6A << 1) // Update address to match WHO_AM_I value
+#define WHO_AM_I_REG 0x0F
+#define CTRL1_XL 0x10
+#define CTRL2_G 0x11
+#define STATUS_REG 0x1E
+#define OUTX_L_G 0x22
+#define OUTX_L_XL 0x28
+
+#define PUL_PIN        GPIO_PIN_2     // PUL+ (PA2)
+#define DIR_PIN        GPIO_PIN_3     // DIR+ (PA3)
+#define BUTTON_PIN     GPIO_PIN_0     // B1 button (PA0)
+#define MOTOR_PORT     GPIOA          // Motor GPIO Port
+#define ELEV_PUL_PIN GPIO_PIN_4  // PUL+ for elevation motor (PC4)
+#define ELEV_DIR_PIN GPIO_PIN_5  // DIR+ for elevation motor (PC5)
+#define ELEV_MOTOR_PORT GPIOC    // Elevation motor GPIO port
+I2C_HandleTypeDef hi2c1;
+extern USBD_HandleTypeDef hUsbDeviceFS;
+
+// Elevation Motor control states
+typedef enum {
+    ELEV_MOTOR_STOP = 0,
+    ELEV_MOTOR_UP,
+    ELEV_MOTOR_DOWN
+} ElevMotorState;
+
+ElevMotorState elevMotorState = ELEV_MOTOR_STOP; // Initial state for elevation motor
+
+// Motor control states
+typedef enum {
+    MOTOR_STOP = 0,
+    MOTOR_CW,
+    MOTOR_CCW
+} MotorState;
+
+MotorState motorState = MOTOR_STOP;   // Initial state: motor stopped
+
+// Scanning pattern states
+typedef enum {
+    SCAN_IDLE = 0,
+    SCAN_INIT,
+    SCAN_MOVE_TO_ZERO,
+    SCAN_ELEV_UP,
+    SCAN_ELEV_DOWN,
+    SCAN_INCREMENT_AZIMUTH,
+    SCAN_RETURN_ZERO
+} ScanState;
+
+static ScanState scanState = SCAN_IDLE;
+
+// Target angles for scanning
+static float targetElevation = 0.0f;
+static float targetAzimuth = 0.0f;
+static float currentElevation = 0.0f;
+static float currentAzimuth = 0.0f;
+
+// Scanning parameters
+static float elevUpAngle = 90.0f;   // Elevation upper bound
+static float elevDownAngle = 5.0f;  // Slightly above 0° to avoid hitting a limit
+static float azimuthMax = 180.0f;   // Azimuth limit for scanning
+static float azimuthStep = 1.0f;    // Increment azimuth by 1° each cycle
+
+// For checking if scanning was requested to stop
+static bool stopRequested = false;
+
+
+char data[64] = "Motor Control Ready\n";
+uint8_t buffer[64] = {0};
+uint32_t lastUsbTransmitTime = 0;
+uint16_t usbTransmitInterval = 500;
+int16_t accel_offset[3];
+int16_t gyro_offset[3];
+
+void SystemClock_Config(void);
+void GPIO_Init(void);
+void ISM330DLC_Init(void);
+void ISM330DLC_Reset(void);
+void ISM330DLC_ReadAccelerometer(int16_t *accel_data);
+void ISM330DLC_ReadGyroscope(int16_t *gyro_data);
+void MX_USB_DEVICE_Init(void);
+void I2C1_Init(void);
+void CDC_Transmit_Data(char* data);
+void Error_Handler(void);
+void Motor_Control(MotorState state);
+void Process_USB_Command(uint8_t* Buf, uint16_t Len);
+void CalculateElevationAndAzimuth(float accel_g[3], float gyro_dps[3], float delta_time, float *elevation, float *azimuth);
+void Motor_Control_Elevation(ElevMotorState state);
+
+float elevation_offset = 0.0f;
+
+
+void Elevation_Calibrate(void) {
+    const int samples = 100;
+    float sum_elevation = 0.0f;
+    for (int i = 0; i < samples; i++) {
+        int16_t accel_data[3];
+        uint8_t status = 0;
+
+        // Wait for new accelerometer data
+        do {
+            HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, STATUS_REG, 1, &status, 1, 100);
+        } while ((status & 0x01) == 0);
+
+        // Read accelerometer
+        ISM330DLC_ReadAccelerometer(accel_data);
+
+        // Convert raw data to g
+        float accel_g[3];
+        accel_g[0] = accel_data[0] * 0.0599f * 0.001f;
+        accel_g[1] = accel_data[1] * 0.0599f * 0.001f;
+        accel_g[2] = accel_data[2] * 0.0599f * 0.001f;
+
+        // Compute temporary elevation
+        float temp_elev = atan2f(sqrtf(accel_g[0]*accel_g[0] + accel_g[1]*accel_g[1]), accel_g[2]) * (180.0f / M_PI);
+
+        sum_elevation += temp_elev;
+
+        HAL_Delay(10);
+    }
+
+    // Average elevation reading to determine offset
+    elevation_offset = (sum_elevation / samples);
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Elevation offset (calibration): %.2f degrees\n", elevation_offset);
+    CDC_Transmit_Data(msg);
+}
+
+
+void Gyro_Calibrate(void) {
+    // We'll average several readings to find the offset
+    int32_t sum[3] = {0};
+    const int samples = 200;
+
+    CDC_Transmit_Data("Calibrating gyro...\n");
+    for (int i = 0; i < samples; i++) {
+        int16_t temp_gyro[3];
+        uint8_t status = 0;
+
+        // Wait for a gyroscope new data ready
+        do {
+            HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, STATUS_REG, 1, &status, 1, 100);
+        } while ((status & 0x02) == 0);
+
+        ISM330DLC_ReadGyroscope(temp_gyro);
+        sum[0] += temp_gyro[0];
+        sum[1] += temp_gyro[1];
+        sum[2] += temp_gyro[2];
+
+        HAL_Delay(5);
+    }
+
+    gyro_offset[0] = sum[0] / samples;
+    gyro_offset[1] = sum[1] / samples;
+    gyro_offset[2] = sum[2] / samples;
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Gyro offsets: X:%d Y:%d Z:%d\n", gyro_offset[0], gyro_offset[1], gyro_offset[2]);
+    CDC_Transmit_Data(msg);
+    CDC_Transmit_Data("Gyro calibration complete.\n");
+}
+void CalculateElevationAndAzimuth(float accel_g[3], float gyro_dps[3], float delta_time, float *elevation, float *azimuth) {
+    static bool initialized = false;
+    static float gyro_azimuth = 0.0f;
+    static float azimuth_offset = 0.0f;
+
+    // Compute elevation from accelerometer
+    float raw_elevation = atan2f(sqrtf(accel_g[0]*accel_g[0] + accel_g[1]*accel_g[1]), accel_g[2]) * 180.0f / M_PI;
+
+    // Subtract the calibration offset so that at the calibrated position, elevation = 0
+    *elevation = raw_elevation - elevation_offset;
+
+    // Initialize azimuth if needed
+    if (!initialized) {
+        azimuth_offset = 0.0f;
+        gyro_azimuth = 0.0f;
+        initialized = true;
+    }
+
+    // Integrate gyro yaw rate (Z-axis)
+    gyro_azimuth += gyro_dps[2] * delta_time;
+    *azimuth = gyro_azimuth + azimuth_offset;
+
+    // Keep azimuth in -180 to 180 degrees
+    if (*azimuth > 180.0f) {
+        *azimuth -= 360.0f;
+    } else if (*azimuth < -180.0f) {
+        *azimuth += 360.0f;
+    }
+}
+
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    GPIO_Init();
+    I2C1_Init();
+    MX_USB_DEVICE_Init();
+
+    ISM330DLC_Reset();
+    ISM330DLC_Init();
+    CDC_Transmit_Data("USB Initialized. Dual Motor Control Ready\n");
+
+    // Calibrate the gyro before main loop
+    Gyro_Calibrate();
+
+    int16_t accel_data[3] = {0};
+    int16_t gyro_data_raw[3] = {0};
+    float accel_g[3] = {0};
+    float gyro_dps[3] = {0};
+    float elevation = 0.0f;
+    float azimuth = 0.0f;
+
+    uint32_t lastSensorUpdate = 0;
+    uint16_t sensorInterval = 100;
+
+    while (1) {
+    if (HAL_GetTick() - lastSensorUpdate >= sensorInterval) {
+        uint8_t status = 0;
+
+        if (HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, STATUS_REG, 1, &status, 1, 100) == HAL_OK) {
+            if (status & 0x01) {
+                ISM330DLC_ReadAccelerometer(accel_data);
+            }
+            if (status & 0x02) {
+                ISM330DLC_ReadGyroscope(gyro_data_raw);
+            }
+
+                // Convert raw accel data to g
+                accel_g[0] = accel_data[0] * 0.0599f * 0.001f;
+                accel_g[1] = accel_data[1] * 0.0599f * 0.001f;
+                accel_g[2] = accel_data[2] * 0.0599f * 0.001f;
+
+                // Subtract gyro offset before converting to dps
+                int16_t gyro_data_cal[3] = {
+                    (int16_t)(gyro_data_raw[0] - gyro_offset[0]),
+                    (int16_t)(gyro_data_raw[1] - gyro_offset[1]),
+                    (int16_t)(gyro_data_raw[2] - gyro_offset[2])
+                };
+
+                // Convert raw gyro data to dps (for ±250 dps)
+                gyro_dps[0] = gyro_data_cal[0] * 0.00875f;
+                gyro_dps[1] = gyro_data_cal[1] * 0.00875f;
+                gyro_dps[2] = gyro_data_cal[2] * 0.00875f;
+
+                 float delta_time = (HAL_GetTick() - lastSensorUpdate) / 1000.0f;
+            CalculateElevationAndAzimuth(accel_g, gyro_dps, delta_time, &elevation, &azimuth);
+
+            char imuData[256];
+            snprintf(imuData, sizeof(imuData),
+                     "Elevation: %.2f degrees, Azimuth: %.2f degrees\n",
+                     elevation, azimuth);
+            CDC_Transmit_Data(imuData);
+
+            lastSensorUpdate = HAL_GetTick();
+        }
+    }
+
+         if (strlen((char*)buffer) > 0) {
+        Process_USB_Command(buffer, strlen((char*)buffer));
+        memset(buffer, 0, sizeof(buffer));
+    }
+
+        // Update current angles from IMU each cycle
+    currentElevation = elevation;
+    currentAzimuth = azimuth;
+
+    // Run scan state machine
+    switch (scanState) {
+        case SCAN_IDLE:
+            // Do nothing
+            break;
+
+        case SCAN_INIT:
+            // Move to (0°,0°)
+            targetElevation = 0.0f;
+            targetAzimuth = 0.0f;
+            scanState = SCAN_MOVE_TO_ZERO;
+            break;
+
+        case SCAN_MOVE_TO_ZERO:
+            MoveToTargetAngles(currentElevation, currentAzimuth, targetElevation, targetAzimuth);
+            if (IsAtTargetAngles(currentElevation, currentAzimuth, targetElevation, targetAzimuth)) {
+                scanState = SCAN_ELEV_UP;
+                targetElevation = elevUpAngle;
+            }
+            break;
+
+        case SCAN_ELEV_UP:
+            MoveToTargetAngles(currentElevation, currentAzimuth, targetElevation, currentAzimuth);
+            if (IsAtTargetElevation(currentElevation, targetElevation)) {
+                scanState = SCAN_ELEV_DOWN;
+                targetElevation = elevDownAngle;
+            }
+            break;
+
+        case SCAN_ELEV_DOWN:
+            MoveToTargetAngles(currentElevation, currentAzimuth, targetElevation, currentAzimuth);
+            if (IsAtTargetElevation(currentElevation, targetElevation)) {
+                scanState = SCAN_INCREMENT_AZIMUTH;
+            }
+            break;
+
+        case SCAN_INCREMENT_AZIMUTH:
+            if (currentAzimuth < azimuthMax) {
+                targetAzimuth = currentAzimuth + azimuthStep;
+                MoveToTargetAngles(currentElevation, currentAzimuth, currentElevation, targetAzimuth);
+                if (IsAtTargetAzimuth(currentAzimuth, targetAzimuth)) {
+                    scanState = SCAN_ELEV_UP;
+                    targetElevation = elevUpAngle;
+                }
+            } else {
+                scanState = SCAN_RETURN_ZERO;
+                targetElevation = 0.0f;
+                targetAzimuth = 0.0f;
+            }
+            break;
+
+        case SCAN_RETURN_ZERO:
+            MoveToTargetAngles(currentElevation, currentAzimuth, targetElevation, targetAzimuth);
+            if (IsAtTargetAngles(currentElevation, currentAzimuth, targetElevation, targetAzimuth)) {
+                scanState = SCAN_IDLE;
+                CDC_Transmit_Data("Scan completed. Returned to 0°,0°.\n");
+            }
+            break;
+
+        default:
+            scanState = SCAN_IDLE;
+            break;
+    }
+
+    // Handle stop request
+    if (stopRequested && scanState != SCAN_IDLE) {
+        scanState = SCAN_RETURN_ZERO;
+        targetElevation = 0.0f;
+        targetAzimuth = 0.0f;
+        stopRequested = false;
+    }
+
+    // After running the FSM, apply the motor controls
+    Motor_Control(motorState);
+    Motor_Control_Elevation(elevMotorState);
+
+    HAL_Delay(10);
+}
+}
+void ISM330DLC_Reset(void) {
+    uint8_t reset_cmd = 0x01; // Reset command for CTRL3_C register
+    if (HAL_I2C_Mem_Write(&hi2c1, ISM330DLC_I2C_ADDRESS, 0x12, 1, &reset_cmd, 1, 100) == HAL_OK) {
+        CDC_Transmit_Data("IMU Reset Command Sent\n");
+    } else {
+        CDC_Transmit_Data("Error: Failed to send IMU Reset Command\n");
+    }
+
+    HAL_Delay(200); // Allow sufficient time for the IMU to reset
+}
+
+// IMU Initialization Function
+void ISM330DLC_Init(void) {
+    // Configure accelerometer (CTRL1_XL: 104 Hz ODR, ±2g range)
+    uint8_t accel_config = 0x50; // ODR = 104 Hz, ±2g
+    if (HAL_I2C_Mem_Write(&hi2c1, ISM330DLC_I2C_ADDRESS, CTRL1_XL, 1, &accel_config, 1, 100) != HAL_OK) {
+        CDC_Transmit_Data("Error: Failed to configure CTRL1_XL\n");
+        return;
+    }
+
+    // Configure gyroscope (CTRL2_G: 208 Hz ODR, 250 dps range)
+    uint8_t gyro_config = 0x50; // ODR = 208 Hz, 250 dps
+    if (HAL_I2C_Mem_Write(&hi2c1, ISM330DLC_I2C_ADDRESS, CTRL2_G, 1, &gyro_config, 1, 100) != HAL_OK) {
+        CDC_Transmit_Data("Error: Failed to configure CTRL2_G\n");
+        return;
+    }
+
+    HAL_Delay(100); // Allow configuration to settle
+    CDC_Transmit_Data("ISM330DLC Initialized Successfully\n");
+}
+
+void GPIO_Init(void) {
+    __HAL_RCC_GPIOA_CLK_ENABLE();  // Enable GPIOA clock
+    __HAL_RCC_GPIOC_CLK_ENABLE();  // Enable GPIOC clock
+
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    // Configure Azimuth motor (PA2, PA3)
+    GPIO_InitStruct.Pin = PUL_PIN | DIR_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(MOTOR_PORT, &GPIO_InitStruct);
+
+    // Configure Elevation motor (PC4, PC5)
+    GPIO_InitStruct.Pin = ELEV_PUL_PIN | ELEV_DIR_PIN;
+    HAL_GPIO_Init(ELEV_MOTOR_PORT, &GPIO_InitStruct);
+
+    // Configure B1 button (PA0)
+    GPIO_InitStruct.Pin = BUTTON_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(MOTOR_PORT, &GPIO_InitStruct);
+}
+void I2C1_Init(void) {
+    __HAL_RCC_I2C1_CLK_ENABLE();  // Enable I2C1 clock
+
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;  // 100 kHz
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+void ISM330DLC_ReadAccelerometer(int16_t *accel_data) {
+    uint8_t accel_buffer[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, OUTX_L_XL, 1, accel_buffer, 6, 100) == HAL_OK) {
+        accel_data[0] = (int16_t)(accel_buffer[1] << 8 | accel_buffer[0]);
+        accel_data[1] = (int16_t)(accel_buffer[3] << 8 | accel_buffer[2]);
+        accel_data[2] = (int16_t)(accel_buffer[5] << 8 | accel_buffer[4]);
+    } else {
+        CDC_Transmit_Data("Error: Failed to read accelerometer\n");
+    }
+}
+
+void ISM330DLC_ReadGyroscope(int16_t *gyro_data) {
+    uint8_t gyro_buffer[6];
+    if (HAL_I2C_Mem_Read(&hi2c1, ISM330DLC_I2C_ADDRESS, OUTX_L_G, 1, gyro_buffer, 6, 100) == HAL_OK) {
+        gyro_data[0] = (int16_t)(gyro_buffer[1] << 8 | gyro_buffer[0]);
+        gyro_data[1] = (int16_t)(gyro_buffer[3] << 8 | gyro_buffer[2]);
+        gyro_data[2] = (int16_t)(gyro_buffer[5] << 8 | gyro_buffer[4]);
+    } else {
+        CDC_Transmit_Data("Error: Failed to read gyroscope\n");
+    }
+}
+
+// Function to transmit data via USB CDC to PuTTY
+void CDC_Transmit_Data(char* data) {
+    while (CDC_Transmit_FS((uint8_t*)data, strlen(data)) == USBD_BUSY) {
+        HAL_Delay(10);  // Wait until the USB buffer is free
+    }
+}
+
+// Function to control motor based on its state
+void Motor_Control(MotorState state) {
+    switch (state) {
+        case MOTOR_CW:
+            // Set DIR+ high for clockwise direction
+            HAL_GPIO_WritePin(MOTOR_PORT, DIR_PIN, GPIO_PIN_SET);
+
+            // Generate a pulse on PUL+
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_SET);
+            HAL_Delay(0);  // Reduce or eliminate delay to increase speed
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_RESET);
+            break;
+
+        case MOTOR_CCW:
+            // Set DIR+ low for counterclockwise direction
+            HAL_GPIO_WritePin(MOTOR_PORT, DIR_PIN, GPIO_PIN_RESET);
+
+            // Generate a pulse on PUL+
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_SET);
+            HAL_Delay(0);  // Reduce or eliminate delay to increase speed
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_RESET);
+            break;
+
+        case MOTOR_STOP:
+        default:
+            // Stop motor (no pulses generated)
+            HAL_GPIO_WritePin(MOTOR_PORT, PUL_PIN, GPIO_PIN_RESET);
+            break;
+    }
+}
+// Function to control elevation motor
+void Motor_Control_Elevation(ElevMotorState state) {
+    switch (state) {
+        case ELEV_MOTOR_UP:
+            // Set DIR+ (PC5) high for upward direction
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_DIR_PIN, GPIO_PIN_SET);
+
+            // Generate a pulse on PUL+ (PC4)
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_PUL_PIN, GPIO_PIN_SET);
+            HAL_Delay(0);  // Adjust delay for speed
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_PUL_PIN, GPIO_PIN_RESET);
+            break;
+
+        case ELEV_MOTOR_DOWN:
+            // Set DIR+ (PC5) low for downward direction
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_DIR_PIN, GPIO_PIN_RESET);
+
+            // Generate a pulse on PUL+ (PC4)
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_PUL_PIN, GPIO_PIN_SET);
+            HAL_Delay(0);  // Adjust delay for speed
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_PUL_PIN, GPIO_PIN_RESET);
+            break;
+
+        case ELEV_MOTOR_STOP:
+        default:
+            // Stop motor (no pulses generated)
+            HAL_GPIO_WritePin(ELEV_MOTOR_PORT, ELEV_PUL_PIN, GPIO_PIN_RESET);
+            break;
+    }
+}
+
+
+// Function to process USB commands received from PuTTY
+void Process_USB_Command(uint8_t* Buf, uint16_t Len) {
+    Buf[Len] = '\0';
+
+    if (strncmp((char*)Buf, "start_cw", strlen("start_cw")) == 0) {
+        motorState = MOTOR_CW;
+        CDC_Transmit_Data("Azimuth motor started clockwise\n");
+    } else if (strncmp((char*)Buf, "start_ccw", strlen("start_ccw")) == 0) {
+        motorState = MOTOR_CCW;
+        CDC_Transmit_Data("Azimuth motor started counterclockwise\n");
+    } else if (strncmp((char*)Buf, "stop", strlen("stop")) == 0) {
+        motorState = MOTOR_STOP;
+        elevMotorState = ELEV_MOTOR_STOP;
+        CDC_Transmit_Data("Motors stopped\n");
+    } else if (strncmp((char*)Buf, "elev_up", strlen("elev_up")) == 0) {
+        elevMotorState = ELEV_MOTOR_UP;
+        CDC_Transmit_Data("Elevation motor started upwards\n");
+    } else if (strncmp((char*)Buf, "elev_down", strlen("elev_down")) == 0) {
+        elevMotorState = ELEV_MOTOR_DOWN;
+        CDC_Transmit_Data("Elevation motor started downwards\n");
+    } else if (strncmp((char*)Buf, "start_scan", strlen("start_scan")) == 0) {
+        if (scanState == SCAN_IDLE) {
+            // Initialize scan sequence
+            scanState = SCAN_INIT;
+            CDC_Transmit_Data("Scan started.\n");
+        } else {
+            CDC_Transmit_Data("Scan already in progress.\n");
+        }
+    } else if (strncmp((char*)Buf, "stop_scan", strlen("stop_scan")) == 0) {
+        // User wants to stop scanning
+        if (scanState != SCAN_IDLE) {
+            stopRequested = true;
+            CDC_Transmit_Data("Stop scan requested. Returning to 0°,0°.\n");
+        } else {
+            CDC_Transmit_Data("No scan in progress.\n");
+        }
+    } else {
+        CDC_Transmit_Data("Invalid command\n");
+    }
+}
+
+
+void SystemClock_Config(void) {
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    // Configure the main internal regulator output voltage
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    // Initializes the RCC Oscillators
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ = 7;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+        Error_Handler();
+    }
+
+    // Initializes the CPU, AHB and APB buses clocks
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+void Error_Handler(void) {
+    // Error handling code (infinite loop or system reset)
+    while(1) {
+        // Optionally toggle an LED or other indicator
+    }
+}
+
