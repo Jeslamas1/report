@@ -197,6 +197,65 @@ Private Sub BuildPassFail3D(ByVal recreate As Boolean)
     ch.Chart.Axes(xlValue).HasTitle = True
     ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Unit Count"
 End Sub
+' --- Report 1: Pass vs Fail by Month (3D clustered columns) based on Date Tested
+Private Sub BuildPassFail3D(ByVal recreate As Boolean)
+    Dim ws As Worksheet, lo As ListObject, pc As PivotCache, pt As PivotTable, ch As ChartObject
+    Dim pfDate As PivotField, pfResult As PivotField
+
+    Set lo = TableByName(RAW_TABLE)
+    If lo Is Nothing Then Exit Sub
+
+    ' Optional but recommended: fixes text-dates so grouping won't fail
+    CoerceDateTestedToDate
+
+    Set ws = EnsureSheet(WS_PASSFAIL, recreate)
+
+    ' (Re)create pivot
+    DeletePivotIfExists ws, PT_PASSFAIL
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=lo.Range)
+    Set pt = ws.PivotTables.Add(PivotCache:=pc, TableDestination:=ws.Range("B5"), TableName:=PT_PASSFAIL)
+
+    With pt
+        ' Rows: Date Tested (group by Years + Months)
+        Set pfDate = .PivotFields("Date Tested")
+        pfDate.Orientation = xlRowField
+        pfDate.Position = 1
+        On Error Resume Next
+        pfDate.ClearAllFilters
+        ' Group by Years and Months
+        pfDate.Parent.PivotFields("Date Tested").Group Start:=True, End:=True, _
+            By:=Array(xlYears, xlMonths)
+        On Error GoTo 0
+
+        ' Columns: Result (Pass/Fail)
+        Set pfResult = .PivotFields("Result")
+        pfResult.Orientation = xlColumnField
+        pfResult.Position = 1
+
+        ' Values: Count of SFC
+        .AddDataField .PivotFields("SFC"), "Count of SFC", xlCount
+
+        ' Layout & sort
+        .RowAxisLayout xlTabularRow
+        On Error Resume Next
+        .PivotFields("Years").AutoSort xlAscending, "Years"
+        .PivotFields("Date Tested").AutoSort xlAscending, "Date Tested"
+        On Error GoTo 0
+    End With
+
+    ' (Re)create chart
+    DeleteChartIfExists ws, CH_PASSFAIL
+    Set ch = ws.ChartObjects.Add(Left:=ws.Range("B2").Left, Top:=ws.Range("B2").Top, Width:=700, Height:=350)
+    ch.Name = CH_PASSFAIL
+    ch.Chart.SetSourceData pt.TableRange1
+    ch.Chart.ChartType = xl3DColumnClustered
+    ch.Chart.HasTitle = True
+    ch.Chart.ChartTitle.Text = "Pass vs Fail by Month (from Date Tested)"
+    ch.Chart.Axes(xlCategory).HasTitle = True
+    ch.Chart.Axes(xlCategory).AxisTitle.Characters.Text = "Year / Month"
+    ch.Chart.Axes(xlValue).HasTitle = True
+    ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Unit Count"
+End Sub
 
 ' --- Report 2: Failure Types (counts)
 Private Sub BuildFailureTypes(ByVal recreate As Boolean)
