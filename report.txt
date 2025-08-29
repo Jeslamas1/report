@@ -57,8 +57,7 @@ Public Sub GenerateReports()
         GoTo CleanExit
     End If
 
-    EnsureMonthFormula
-	EnsureFailsCountFormula
+   
     If TableRowCount(RAW_TABLE) = 0 Then
         ClearReportSheets
         MsgBox "No rows in RawData. Add data, then click Generate.", vbInformation
@@ -66,6 +65,14 @@ Public Sub GenerateReports()
     End If
 
     BuildAllReports False  ' False = refresh only (don’t delete/replace objects)
+
+    ' ---- ADD: build Pareto charts (requires Pareto module in project) ----
+    On Error Resume Next              ' don't let Pareto hiccups kill the run
+    Pareto_FailureType_All            ' 5 buckets, weighted by #Fails
+    Pareto_Component_All              ' by Component Name, weighted by #Fails
+    On Error GoTo CleanFail
+    ' ---------------------------------------------------------------------
+
     MsgBox "Reports refreshed.", vbInformation
 
 CleanExit:
@@ -76,6 +83,7 @@ CleanFail:
     MsgBox "Generate failed: " & Err.Description, vbExclamation
     Resume CleanExit
 End Sub
+
 
 ' ===========================
 ' ====== SETUP HELPERS ======
