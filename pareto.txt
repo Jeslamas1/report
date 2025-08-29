@@ -39,19 +39,22 @@ Private Sub BuildParetoWeighted(ByVal categoryHeader As String, _
     End If
     
     ' Header locations (robust to column order; uses your names)
-    Dim cDate As Long, cSFC As Long, cCCA As Long, cRes As Long, cType As Long
-    Dim cPN As Long, cName As Long, cOp As Long, cCom As Long, cMonth As Long, cNumFails As Long
-    cDate = FindHeaderCol(ws, "DateTested", 1, lastCol)
-    cSFC = FindHeaderCol(ws, "SFC", 1, lastCol)
-    cCCA = FindHeaderCol(ws, "CCA", 1, lastCol)
-    cRes = FindHeaderCol(ws, "Result", 1, lastCol)
-    cType = FindHeaderCol(ws, "Failure Type", 1, lastCol)     ' E
-    cPN = FindHeaderCol(ws, "Component Part Number", 1, lastCol)
-    cName = FindHeaderCol(ws, "Component Name", 1, lastCol)   ' G
-    cOp = FindHeaderCol(ws, "Operation", 1, lastCol)
-    cCom = FindHeaderCol(ws, "Comment", 1, lastCol)
-    cMonth = FindHeaderCol(ws, "Month", 1, lastCol)           ' J
-    cNumFails = FindHeaderCol(ws, "Number of Fails", 1, lastCol) ' K
+    ' Header locations (based on your exact headers row 1)
+Dim cDate As Long, cSFC As Long, cCCA As Long, cRes As Long, cType As Long
+Dim cPN As Long, cName As Long, cOp As Long, cCom As Long, cMonth As Long, cNumFails As Long
+
+cDate = FindHeaderCol(ws, "Date Tested", 1, lastCol)
+cSFC = FindHeaderCol(ws, "SFC", 1, lastCol)
+cCCA = FindHeaderCol(ws, "CCA", 1, lastCol)
+cRes = FindHeaderCol(ws, "Result", 1, lastCol)
+cType = FindHeaderCol(ws, "Failure Type", 1, lastCol)
+cPN = FindHeaderCol(ws, "Component PN", 1, lastCol)
+cName = FindHeaderCol(ws, "Component Name", 1, lastCol)
+cOp = FindHeaderCol(ws, "Operation", 1, lastCol)
+cCom = FindHeaderCol(ws, "Comments", 1, lastCol)
+cMonth = FindHeaderCol(ws, "Month", 1, lastCol)
+cNumFails = FindHeaderCol(ws, "#Fails", 1, lastCol)
+
     
     If cRes = 0 Or cMonth = 0 Or cNumFails = 0 Then
         MsgBox "Missing required headers (Result, Month, Number of Fails).", vbExclamation
