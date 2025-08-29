@@ -105,7 +105,7 @@ Private Sub EnsureRawSheetAndTable()
     If lo Is Nothing Then
         ' Size the table to current used range (or at least headers row)
         Dim lastCol As Long, lastRow As Long
-        lastCol = 10
+        lastCol = 11
         lastRow = Application.Max(2, ws.Cells(ws.Rows.Count, "A").End(xlUp).Row)
         Dim rng As Range
         Set rng = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol))
@@ -156,7 +156,9 @@ Private Sub BuildAllReports(ByVal recreate As Boolean)
     BuildPassFail3D recreate
     BuildFailureTypes recreate
     BuildFailuresByComponent recreate
+    ParetoByFailureType_FiveBuckets   ' <-- add this
 End Sub
+
 
 ' --- Report 1: Pass vs Fail by Month (3D clustered columns)
 Private Sub BuildPassFail3D(ByVal recreate As Boolean)
@@ -390,15 +392,26 @@ Private Function NormalizeToFive(ByVal s As String) As String
 End Function
 
 ' ---- HELPERS ----
-Private Function EnsureSheet(ByVal name As String) As Worksheet
+' One version only
+Private Function EnsureSheet(ByVal name As String, Optional ByVal recreate As Boolean = False) As Worksheet
     On Error Resume Next
     Set EnsureSheet = ThisWorkbook.Worksheets(name)
     On Error GoTo 0
+
     If EnsureSheet Is Nothing Then
-        Set EnsureSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        Set EnsureSheet = ThisWorkbook.Worksheets.Add(After:=Sheets(Sheets.Count))
         EnsureSheet.Name = name
+    ElseIf recreate Then
+        EnsureSheet.Cells.Clear
     End If
+
+    With EnsureSheet.Range("B2")
+        .Value = name
+        .Font.Bold = True
+        .Font.Size = 16
+    End With
 End Function
+
 
 Private Sub AppOn()
     Application.ScreenUpdating = False
