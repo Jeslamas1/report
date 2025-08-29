@@ -256,6 +256,161 @@ Private Sub BuildPassFail3D(ByVal recreate As Boolean)
     ch.Chart.Axes(xlValue).HasTitle = True
     ch.Chart.Axes(xlValue).AxisTitle.Characters.Text = "Unit Count"
 End Sub
+Option Explicit
+
+Private Const RAW_SHEET As String = "RawData"
+Private Const RAW_TABLE As String = "tblRaw"
+Private Const WS_PARETO As String = "FailureTypes_Pareto"
+Private Const WS_TMP As String = "~tmpPareto"
+
+Public Sub ParetoByFailureType_FiveBuckets()
+    BuildPareto_FiveBuckets "Failure Type", "Result", "Pareto - Failures by Failure Type"
+End Sub
+
+Private Sub BuildPareto_FiveBuckets(ByVal failureTypeField As String, _
+                                    ByVal resultField As String, _
+                                    ByVal chartTitle As String)
+    Dim wsData As Worksheet, lo As ListObject
+    Dim idxType As Long, idxRes As Long
+    Dim counts As Object, total As Long
+    Dim r As ListRow
+    Dim buckets As Variant, i As Long, n As Long
+    
+    On Error GoTo FailFast
+    AppOn
+    
+    buckets = Array("TBD:PART", "TBD", "PART", "OP ERROR", "WORKMANSHIP")
+    
+    Set wsData = ThisWorkbook.Worksheets(RAW_SHEET)
+    Set lo = wsData.ListObjects(RAW_TABLE)
+    idxType = lo.ListColumns(failureTypeField).Index
+    idxRes  = lo.ListColumns(resultField).Index
+    
+    Set counts = CreateObject("Scripting.Dictionary")
+    counts.CompareMode = 1
+    For i = LBound(buckets) To UBound(buckets)
+        counts(buckets(i)) = 0&
+    Next i
+    
+    ' ---- TALLY (exclude only explicit PASS) ----
+    Dim resVal As String, rawType As String, normType As String
+    For Each r In lo.ListRows
+        resVal = LCase$(Trim$(CStr(r.Range.Cells(1, idxRes).Value)))
+        If resVal <> "pass" Then                   ' blanks, "fail", etc. are counted
+            rawType = Trim$(CStr(r.Range.Cells(1, idxType).Value))
+            If Len(rawType) = 0 Then rawType = "TBD"
+            normType = NormalizeToFive(rawType)
+            If counts.Exists(normType) Then
+                counts(normType) = counts(normType) + 1&
+                total = total + 1&
+            End If
+        End If
+    Next r
+    
+    ' ---- DUMP to tmp in fixed order ----
+    Dim wsTmp As Worksheet: Set wsTmp = EnsureSheet(WS_TMP)
+    wsTmp.Cells.Clear
+    wsTmp.Range("A1:E1").Value = Array("Category", "Count", "Percent", "CumPercent", "Rank")
+    
+    n = UBound(buckets) - LBound(buckets) + 1
+    For i = 0 To n - 1
+        wsTmp.Cells(i + 2, 1).Value = buckets(i)
+        wsTmp.Cells(i + 2, 2).Value = counts(buckets(i))
+    Next i
+    
+    If total > 0 Then
+        wsTmp.Range("C2").Resize(n, 1).FormulaR1C1 = "=RC[-1]/" & total
+        wsTmp.Range("D2").Resize(n, 1).FormulaR1C1 = "=SUM(R2C3:RC[-1])"
+    Else
+        wsTmp.Range("C2:D" & n + 1).Value = 0
+    End If
+    wsTmp.Range("E2").Resize(n, 1).FormulaR1C1 = "=ROW()-1"
+    wsTmp.Columns("A:E").AutoFit
+    
+    ' ---- CHART ----
+    Dim wsChart As Worksheet: Set wsChart = EnsureSheet(WS_PARETO)
+    wsChart.Cells.Clear
+    
+    Dim ch As ChartObject: Set ch = wsChart.ChartObjects.Add(Left:=20, Top:=20, Width:=820, Height:=440)
+    With ch.Chart
+        .ChartType = xlColumnClustered
+        .SetSourceData Source:=wsTmp.Range("A1").Resize(n + 1, 2)
+        
+        Dim sCum As Series
+        Set sCum = .SeriesCollection.NewSeries
+        sCum.Name = "Cumulative %"
+        sCum.XValues = wsTmp.Range("A2").Resize(n, 1)
+        sCum.Values = wsTmp.Range("D2").Resize(n, 1)
+        sCum.ChartType = xlLine
+        sCum.AxisGroup = xlSecondary
+        
+        With .Axes(xlValue, xlSecondary)
+            .HasTitle = True
+            .AxisTitle.Text = "Cumulative %"
+            .MinimumScale = 0
+            .MaximumScale = 1
+            .TickLabels.NumberFormat = "0%"
+        End With
+        
+        .Axes(xlValue, xlPrimary).HasTitle = True
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Failure Count"
+        .HasTitle = True
+        .ChartTitle.Text = chartTitle
+        .Legend.Position = xlLegendPositionBottom
+    End With
+
+CleanExit:
+    AppOff
+    Exit Sub
+FailFast:
+    MsgBox "Pareto build failed: " & Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+' ---- NORMALIZATION to your 5 buckets ----
+Private Function NormalizeToFive(ByVal s As String) As String
+    Dim t As String: t = LCase$(Trim$(s))
+    t = Replace(t, vbTab, " ")
+    Do While InStr(t, "  ") > 0: t = Replace(t, "  ", " "): Loop
+    
+    If (InStr(t, "tbd") > 0 And InStr(t, "part") > 0) Then
+        NormalizeToFive = "TBD:PART"
+    ElseIf t Like "*op error*" Or t Like "*operator error*" Or t Like "*op-error*" Then
+        NormalizeToFive = "OP ERROR"
+    ElseIf t Like "*workmanship*" Then
+        NormalizeToFive = "WORKMANSHIP"
+    ElseIf InStr(t, "tbd") > 0 Then
+        NormalizeToFive = "TBD"
+    ElseIf InStr(t, "part") > 0 Then
+        NormalizeToFive = "PART"
+    Else
+        ' fallback—choose the closest; adjust if desired
+        NormalizeToFive = "PART"
+    End If
+End Function
+
+' ---- HELPERS ----
+Private Function EnsureSheet(ByVal name As String) As Worksheet
+    On Error Resume Next
+    Set EnsureSheet = ThisWorkbook.Worksheets(name)
+    On Error GoTo 0
+    If EnsureSheet Is Nothing Then
+        Set EnsureSheet = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.Count))
+        EnsureSheet.Name = name
+    End If
+End Function
+
+Private Sub AppOn()
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+End Sub
+
+Private Sub AppOff()
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+End Sub
 
 ' --- Report 2: Failure Types (counts)
 Private Sub BuildFailureTypes(ByVal recreate As Boolean)
