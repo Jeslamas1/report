@@ -1,71 +1,143 @@
 Option Explicit
 
-' ========= CONFIG =========
-Private Const RAW_SHEET As String = "RawData"
-Private Const RAW_TABLE As String = "tblRaw"               ' Excel Table name
-Private Const WS_PARETO As String = "FailureTypes_Pareto"  ' output chart sheet
-Private Const WS_TMP As String = "~tmpPareto"              ' helper sheet
+' ==== CONFIG ====
+Private Const RAW_SHEET As String = "RawData"           ' your data sheet
+Private Const WS_TMP As String = "~tmpPareto"           ' helper
+Private Const WS_PARETO_TYPE As String = "Pareto_FailureType"
+Private Const WS_PARETO_COMP As String = "Pareto_ComponentName"
 
-' ========= ENTRY POINT =========
-Public Sub ParetoByFailureType_FiveBuckets()
-    BuildPareto_FiveBuckets "Failure Type", "Result", "Pareto - Failures by Failure Type"
+' ==== ENTRY POINTS ====
+Public Sub BuildPareto_FailureType(Optional ByVal monthKey As String = "")
+    ' monthKey example: "2025-08" (matches your Column J values); "" = all months
+    BuildParetoWeighted categoryHeader:="Failure Type", _
+                        normalizeToFive:=True, _
+                        chartSheetName:=WS_PARETO_TYPE, _
+                        chartTitle:="Pareto - Failures by Failure Type", _
+                        monthKey:=monthKey
 End Sub
 
-' ========= CORE =========
-Private Sub BuildPareto_FiveBuckets(ByVal failureTypeField As String, _
-                                    ByVal resultField As String, _
-                                    ByVal chartTitle As String)
-    Dim wsData As Worksheet, lo As ListObject
-    Dim idxType As Long, idxRes As Long
-    Dim counts As Object, total As Long
-    Dim r As ListRow
-    Dim buckets As Variant, i As Long, n As Long
-    Dim resVal As String, rawType As String, normType As String
+Public Sub BuildPareto_ComponentName(Optional ByVal monthKey As String = "")
+    BuildParetoWeighted categoryHeader:="Component Name", _
+                        normalizeToFive:=False, _
+                        chartSheetName:=WS_PARETO_COMP, _
+                        chartTitle:="Pareto - Failures by Component", _
+                        monthKey:=monthKey
+End Sub
+
+' ==== CORE ====
+Private Sub BuildParetoWeighted(ByVal categoryHeader As String, _
+                                ByVal normalizeToFive As Boolean, _
+                                ByVal chartSheetName As String, _
+                                ByVal chartTitle As String, _
+                                Optional ByVal monthKey As String = "")
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(RAW_SHEET)
+    Dim lastRow As Long, lastCol As Long
+    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Then
+        MsgBox "No data rows found.", vbExclamation: Exit Sub
+    End If
     
-    On Error GoTo FailFast
-    AppOn
+    ' Header locations (robust to column order; uses your names)
+    Dim cDate As Long, cSFC As Long, cCCA As Long, cRes As Long, cType As Long
+    Dim cPN As Long, cName As Long, cOp As Long, cCom As Long, cMonth As Long, cNumFails As Long
+    cDate = FindHeaderCol(ws, "DateTested", 1, lastCol)
+    cSFC = FindHeaderCol(ws, "SFC", 1, lastCol)
+    cCCA = FindHeaderCol(ws, "CCA", 1, lastCol)
+    cRes = FindHeaderCol(ws, "Result", 1, lastCol)
+    cType = FindHeaderCol(ws, "Failure Type", 1, lastCol)     ' E
+    cPN = FindHeaderCol(ws, "Component Part Number", 1, lastCol)
+    cName = FindHeaderCol(ws, "Component Name", 1, lastCol)   ' G
+    cOp = FindHeaderCol(ws, "Operation", 1, lastCol)
+    cCom = FindHeaderCol(ws, "Comment", 1, lastCol)
+    cMonth = FindHeaderCol(ws, "Month", 1, lastCol)           ' J
+    cNumFails = FindHeaderCol(ws, "Number of Fails", 1, lastCol) ' K
     
-    ' fixed bucket order you asked for
-    buckets = Array("TBD:PART", "TBD", "PART", "OP ERROR", "WORKMANSHIP")
+    If cRes = 0 Or cMonth = 0 Or cNumFails = 0 Then
+        MsgBox "Missing required headers (Result, Month, Number of Fails).", vbExclamation
+        Exit Sub
+    End If
+    Dim cCat As Long
+    If categoryHeader = "Failure Type" Then
+        cCat = cType
+    ElseIf categoryHeader = "Component Name" Then
+        cCat = cName
+    Else
+        MsgBox "Unknown category header: " & categoryHeader, vbExclamation: Exit Sub
+    End If
     
-    ' get the table
-    Set wsData = ThisWorkbook.Worksheets(RAW_SHEET)
-    Set lo = wsData.ListObjects(RAW_TABLE)
-    idxType = lo.ListColumns(failureTypeField).Index
-    idxRes  = lo.ListColumns(resultField).Index
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = 1 ' TextCompare
+    Dim total As Double: total = 0
     
-    ' init counters
-    Set counts = CreateObject("Scripting.Dictionary")
-    counts.CompareMode = 1 ' TextCompare
-    For i = LBound(buckets) To UBound(buckets)
-        counts(buckets(i)) = 0&
-    Next i
+    ' For normalized failure type Pareto: seed fixed 5 buckets
+    Dim buckets As Variant, i As Long
+    If normalizeToFive Then
+        buckets = Array("TBD:PART", "TBD", "PART", "OP ERROR", "WORKMANSHIP")
+        For i = LBound(buckets) To UBound(buckets)
+            dict(buckets(i)) = 0#
+        Next i
+    End If
     
-    ' Tally: EXCLUDE only explicit "Pass"; count blanks/fails/etc.
-    For Each r In lo.ListRows
-        resVal = LCase$(Trim$(CStr(r.Range.Cells(1, idxRes).Value)))
-        If resVal <> "pass" Then
-            rawType = Trim$(CStr(r.Range.Cells(1, idxType).Value))
-            If Len(rawType) = 0 Then rawType = "TBD"        ' choose your default for blank
-            normType = NormalizeToFive(rawType)             ' map messy text into the 5 buckets
-            If counts.Exists(normType) Then
-                counts(normType) = counts(normType) + 1&
-                total = total + 1&
+    ' Tally weights (Number of Fails), exclude only explicit "Pass"
+    Dim r As Long, resVal As String, catRaw As String, catKey As String, mKey As String
+    Dim w As Double, cellVal As Variant
+    For r = 2 To lastRow
+        ' Month filter (optional)
+        mKey = Trim$(CStr(ws.Cells(r, cMonth).Value))
+        If (Len(monthKey) = 0) Or (LCase$(mKey) = LCase$(monthKey)) Then
+            resVal = LCase$(Trim$(CStr(ws.Cells(r, cRes).Value)))
+            If resVal <> "pass" Then
+                catRaw = Trim$(CStr(ws.Cells(r, cCat).Value))
+                If normalizeToFive Then
+                    If Len(catRaw) = 0 Then catRaw = "TBD"
+                    catKey = NormalizeToFive(catRaw)
+                Else
+                    If Len(catRaw) = 0 Then catKey = "(Unspecified)" Else catKey = catRaw
+                End If
+                ' weight from Number of Fails (K); blank -> 1
+                cellVal = ws.Cells(r, cNumFails).Value
+                If IsNumeric(cellVal) And Len(Trim$(cellVal)) > 0 Then
+                    w = CDbl(cellVal)
+                Else
+                    w = 1#
+                End If
+                If Not dict.Exists(catKey) Then dict(catKey) = 0#
+                dict(catKey) = dict(catKey) + w
+                total = total + w
             End If
         End If
     Next r
     
-    ' Dump summary to helper sheet in fixed order
+    ' Dump to helper sheet and sort desc
     Dim wsTmp As Worksheet: Set wsTmp = GetOrAddSheet(WS_TMP)
     wsTmp.Cells.Clear
     wsTmp.Range("A1:E1").Value = Array("Category", "Count", "Percent", "CumPercent", "Rank")
     
-    n = UBound(buckets) - LBound(buckets) + 1
+    Dim keys As Variant, n As Long
+    keys = dict.Keys: n = dict.Count
+    If n = 0 Then
+        wsTmp.Range("A2").Value = "No data to chart."
+        BuildOrRefreshChart chartSheetName, chartTitle, wsTmp, 1
+        Exit Sub
+    End If
+    
+    ' Write unsorted
     For i = 0 To n - 1
-        wsTmp.Cells(i + 2, 1).Value = buckets(i)
-        wsTmp.Cells(i + 2, 2).Value = counts(buckets(i))
+        wsTmp.Cells(i + 2, 1).Value = CStr(keys(i))
+        wsTmp.Cells(i + 2, 2).Value = CDbl(dict(keys(i)))
     Next i
     
+    ' Sort by Count desc
+    With wsTmp.Sort
+        .SortFields.Clear
+        .SortFields.Add Key:=wsTmp.Range("B2").Resize(n, 1), SortOn:=xlSortOnValues, Order:=xlDescending, DataOption:=xlSortNormal
+        .SetRange wsTmp.Range("A1").Resize(n + 1, 2)
+        .Header = xlYes
+        .Apply
+    End With
+    
+    ' Percent, cumulative, rank
     If total > 0 Then
         wsTmp.Range("C2").Resize(n, 1).FormulaR1C1 = "=RC[-1]/" & total
         wsTmp.Range("D2").Resize(n, 1).FormulaR1C1 = "=SUM(R2C3:RC[-1])"
@@ -75,48 +147,49 @@ Private Sub BuildPareto_FiveBuckets(ByVal failureTypeField As String, _
     wsTmp.Range("E2").Resize(n, 1).FormulaR1C1 = "=ROW()-1"
     wsTmp.Columns("A:E").AutoFit
     
-    ' Build/refresh chart sheet
-    Dim wsChart As Worksheet: Set wsChart = GetOrAddSheet(WS_PARETO)
+    ' Build / refresh chart
+    BuildOrRefreshChart chartSheetName, chartTitle, wsTmp, n
+End Sub
+
+' ==== CHART BUILDER ====
+Private Sub BuildOrRefreshChart(ByVal chartSheetName As String, ByVal chartTitle As String, _
+                                ByVal wsTmp As Worksheet, ByVal n As Long)
+    Dim wsChart As Worksheet: Set wsChart = GetOrAddSheet(chartSheetName)
     wsChart.Cells.Clear
     
-    Dim ch As ChartObject: Set ch = wsChart.ChartObjects.Add(Left:=20, Top:=20, Width:=820, Height:=440)
+    Dim ch As ChartObject
+    Set ch = wsChart.ChartObjects.Add(Left:=20, Top:=20, Width:=860, Height:=460)
     With ch.Chart
         .ChartType = xlColumnClustered
-        .SetSourceData Source:=wsTmp.Range("A1").Resize(n + 1, 2) ' Category & Count
+        .SetSourceData Source:=wsTmp.Range("A1").Resize(Application.Max(2, n + 1), 2)
         
-        ' Cumulative % line (secondary axis)
-        Dim sCum As Series
-        Set sCum = .SeriesCollection.NewSeries
-        sCum.Name = "Cumulative %"
-        sCum.XValues = wsTmp.Range("A2").Resize(n, 1)
-        sCum.Values = wsTmp.Range("D2").Resize(n, 1)
-        sCum.ChartType = xlLine
-        sCum.AxisGroup = xlSecondary
-        
-        With .Axes(xlValue, xlSecondary)
-            .HasTitle = True
-            .AxisTitle.Text = "Cumulative %"
-            .MinimumScale = 0
-            .MaximumScale = 1
-            .TickLabels.NumberFormat = "0%"
-        End With
+        If n > 0 Then
+            Dim sCum As Series
+            Set sCum = .SeriesCollection.NewSeries
+            sCum.Name = "Cumulative %"
+            sCum.XValues = wsTmp.Range("A2").Resize(n, 1)
+            sCum.Values = wsTmp.Range("D2").Resize(n, 1)
+            sCum.ChartType = xlLine
+            sCum.AxisGroup = xlSecondary
+            
+            With .Axes(xlValue, xlSecondary)
+                .HasTitle = True
+                .AxisTitle.Text = "Cumulative %"
+                .MinimumScale = 0
+                .MaximumScale = 1
+                .TickLabels.NumberFormat = "0%"
+            End With
+        End If
         
         .Axes(xlValue, xlPrimary).HasTitle = True
-        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Failure Count"
+        .Axes(xlValue, xlPrimary).AxisTitle.Text = "Weighted Fail Count"
         .HasTitle = True
         .ChartTitle.Text = chartTitle
         .Legend.Position = xlLegendPositionBottom
     End With
-
-CleanExit:
-    AppOff
-    Exit Sub
-FailFast:
-    MsgBox "Pareto build failed: " & Err.Description, vbExclamation
-    Resume CleanExit
 End Sub
 
-' ========= NORMALIZATION =========
+' ==== NORMALIZATION (5 buckets) ====
 Private Function NormalizeToFive(ByVal s As String) As String
     Dim t As String: t = LCase$(Trim$(s))
     t = Replace(t, vbTab, " ")
@@ -133,11 +206,22 @@ Private Function NormalizeToFive(ByVal s As String) As String
     ElseIf InStr(t, "part") > 0 Then
         NormalizeToFive = "PART"
     Else
-        NormalizeToFive = "PART" ' fallback bucket
+        NormalizeToFive = "PART" ' fallback
     End If
 End Function
 
-' ========= HELPERS =========
+' ==== HELPERS ====
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerText As String, _
+                               ByVal headerRow As Long, ByVal lastCol As Long) As Long
+    Dim c As Long
+    For c = 1 To lastCol
+        If LCase$(Trim$(CStr(ws.Cells(headerRow, c).Value))) = LCase$(headerText) Then
+            FindHeaderCol = c: Exit Function
+        End If
+    Next c
+    FindHeaderCol = 0
+End Function
+
 Private Function GetOrAddSheet(ByVal name As String) As Worksheet
     Dim ws As Worksheet
     On Error Resume Next
@@ -149,15 +233,3 @@ Private Function GetOrAddSheet(ByVal name As String) As Worksheet
     End If
     Set GetOrAddSheet = ws
 End Function
-
-Private Sub AppOn()
-    Application.ScreenUpdating = False
-    Application.EnableEvents = False
-    Application.DisplayAlerts = False
-End Sub
-
-Private Sub AppOff()
-    Application.DisplayAlerts = True
-    Application.EnableEvents = True
-    Application.ScreenUpdating = True
-End Sub
