@@ -6,7 +6,7 @@ Private Const WS_TMP As String = "~tmpPareto"
 Private Const WS_PARETO_TYPE As String = "Pareto_FailureType"
 Private Const WS_PARETO_COMP As String = "Pareto_ComponentName"
 
-'==== PUBLIC ENTRY POINTS ====
+'==== ENTRY POINTS ====
 Public Sub Pareto_FailureType_All()
     BuildPareto categoryHeader:="Failure Type", _
                 normalizeToFive:=True, _
@@ -23,11 +23,6 @@ Public Sub Pareto_Component_All()
                 monthKey:=""
 End Sub
 
-' Example: filter a specific month stored in Column J (e.g., "2025-08")
-Public Sub Pareto_FailureType_Month()
-    BuildPareto "Failure Type", True, WS_PARETO_TYPE, "Pareto - Failures by Failure Type (Month)", "2025-08"
-End Sub
-
 '==== CORE ====
 Private Sub BuildPareto(ByVal categoryHeader As String, _
                         ByVal normalizeToFive As Boolean, _
@@ -41,7 +36,7 @@ Private Sub BuildPareto(ByVal categoryHeader As String, _
     If lastRow < 2 Then MsgBox "No data rows.", vbExclamation: Exit Sub
     lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
 
-    ' Locate headers EXACTLY as you provided
+    ' headers (exactly as in your sheet)
     Dim cRes As Long, cType As Long, cName As Long, cMonth As Long, cFails As Long, cCat As Long
     cRes = FindHeader(ws, "Result", lastCol)
     cType = FindHeader(ws, "Failure Type", lastCol)
@@ -64,7 +59,7 @@ Private Sub BuildPareto(ByVal categoryHeader As String, _
     Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
     dict.CompareMode = 1 ' TextCompare
 
-    ' Seed 5 buckets if normalizing Failure Type
+    ' 5 fixed buckets for Failure Type
     Dim buckets As Variant, i As Long
     If normalizeToFive Then
         buckets = Array("TBD:PART", "TBD", "PART", "OP ERROR", "WORKMANSHIP")
@@ -73,8 +68,8 @@ Private Sub BuildPareto(ByVal categoryHeader As String, _
         Next i
     End If
 
-    ' Tally: exclude only explicit "Pass"; weight by #Fails (blank -> 1)
-    Dim r As Long, resVal As String, rawCat As String, key As String
+    ' tally (exclude only explicit "Pass"), weight by #Fails (blank -> 1)
+    Dim r As Long, resVal As String, rawCat As String, catKey As String
     Dim w As Double, valFails As Variant, mKey As String, total As Double
     For r = 2 To lastRow
         mKey = Trim$(CStr(ws.Cells(r, cMonth).Value))
@@ -84,24 +79,26 @@ Private Sub BuildPareto(ByVal categoryHeader As String, _
                 rawCat = Trim$(CStr(ws.Cells(r, cCat).Value))
                 If normalizeToFive Then
                     If Len(rawCat) = 0 Then rawCat = "TBD"
-                    key = NormalizeToFive(rawCat)
+                    catKey = MapFailureTypeToBucket5(rawCat)
                 Else
-                    key = IIf(Len(rawCat) = 0, "(Unspecified)", rawCat)
+                    catKey = IIf(Len(rawCat) = 0, "(Unspecified)", rawCat)
                 End If
+
                 valFails = ws.Cells(r, cFails).Value
                 If IsNumeric(valFails) And Len(Trim$(valFails)) > 0 Then
                     w = CDbl(valFails)
                 Else
                     w = 1#
                 End If
-                If Not dict.Exists(key) Then dict(key) = 0#
-                dict(key) = dict(key) + w
+
+                If Not dict.Exists(catKey) Then dict(catKey) = 0#
+                dict(catKey) = dict(catKey) + w
                 total = total + w
             End If
         End If
     Next r
 
-    ' Dump to helper and compute % / cum%
+    ' helper sheet
     Dim wsTmp As Worksheet: Set wsTmp = GetOrAddSheet(WS_TMP)
     wsTmp.Cells.Clear
     wsTmp.Range("A1:E1").Value = Array("Category", "Count", "Percent", "CumPercent", "Rank")
@@ -119,7 +116,7 @@ Private Sub BuildPareto(ByVal categoryHeader As String, _
         wsTmp.Cells(i + 2, 2).Value = CDbl(dict(keys(i)))
     Next i
 
-    ' Sort by Count desc
+    ' sort by Count desc
     With wsTmp.Sort
         .SortFields.Clear
         .SortFields.Add Key:=wsTmp.Range("B2").Resize(n, 1), SortOn:=xlSortOnValues, Order:=xlDescending, DataOption:=xlSortNormal
@@ -137,9 +134,29 @@ Private Sub BuildPareto(ByVal categoryHeader As String, _
     wsTmp.Range("E2").Resize(n, 1).FormulaR1C1 = "=ROW()-1"
     wsTmp.Columns("A:E").AutoFit
 
-    ' Chart
     BuildChart chartSheetName, chartTitle, wsTmp, n
 End Sub
+
+'==== MAP TO 5 BUCKETS (renamed to avoid conflicts) ====
+Private Function MapFailureTypeToBucket5(ByVal s As String) As String
+    Dim t As String: t = LCase$(Trim$(s))
+    t = Replace(t, vbTab, " ")
+    Do While InStr(t, "  ") > 0: t = Replace(t, "  ", " "): Loop
+
+    If (InStr(t, "tbd") > 0 And InStr(t, "part") > 0) Then
+        MapFailureTypeToBucket5 = "TBD:PART"
+    ElseIf t Like "*op error*" Or t Like "*operator error*" Or t Like "*op-error*" Then
+        MapFailureTypeToBucket5 = "OP ERROR"
+    ElseIf t Like "*workmanship*" Then
+        MapFailureTypeToBucket5 = "WORKMANSHIP"
+    ElseIf InStr(t, "tbd") > 0 Then
+        MapFailureTypeToBucket5 = "TBD"
+    ElseIf InStr(t, "part") > 0 Then
+        MapFailureTypeToBucket5 = "PART"
+    Else
+        MapFailureTypeToBucket5 = "PART" ' fallback
+    End If
+End Function
 
 '==== CHART ====
 Private Sub BuildChart(ByVal chartSheetName As String, ByVal chartTitle As String, _
@@ -178,27 +195,6 @@ Private Sub BuildChart(ByVal chartSheetName As String, ByVal chartTitle As Strin
         .Legend.Position = xlLegendPositionBottom
     End With
 End Sub
-
-'==== NORMALIZATION (5 buckets) ====
-Private Function NormalizeToFive(ByVal s As String) As String
-    Dim t As String: t = LCase$(Trim$(s))
-    t = Replace(t, vbTab, " ")
-    Do While InStr(t, "  ") > 0: t = Replace(t, "  ", " "): Loop
-
-    If (InStr(t, "tbd") > 0 And InStr(t, "part") > 0) Then
-        NormalizeToFive = "TBD:PART"
-    ElseIf t Like "*op error*" Or t Like "*operator error*" Or t Like "*op-error*" Then
-        NormalizeToFive = "OP ERROR"
-    ElseIf t Like "*workmanship*" Then
-        NormalizeToFive = "WORKMANSHIP"
-    ElseIf InStr(t, "tbd") > 0 Then
-        NormalizeToFive = "TBD"
-    ElseIf InStr(t, "part") > 0 Then
-        NormalizeToFive = "PART"
-    Else
-        NormalizeToFive = "PART" ' fallback
-    End If
-End Function
 
 '==== HELPERS ====
 Private Function FindHeader(ByVal ws As Worksheet, ByVal headerText As String, ByVal lastCol As Long) As Long
